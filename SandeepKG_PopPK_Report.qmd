@@ -1,0 +1,1423 @@
+---
+title: "Population Pharmacokinetic Analysis Report"
+format: 
+ html:
+   theme: flatly
+   toc: true
+   code-fold: true
+   fig-dpi: 600
+author: "Sandeep Konaka Gautamdas"
+date: 2026-03-30
+toc: true
+engine: julia
+julia:
+  exeflags: ["--project=@Pumas@2.8.0"]
+---
+
+```{julia}
+#| echo: false
+#| output: false    
+using Pumas
+using PumasUtilities
+using SummaryTables
+using PharmaDatasets
+using Dates
+using Random
+using DataFramesMeta
+using CSV
+using ReadStatTables
+using CategoricalArrays
+using Random
+using AlgebraOfGraphics
+using CairoMakie
+using PairPlots
+using Statistics
+using StatsBase
+using GLM: lm, @formula
+using LinearAlgebra
+using StatsPlots
+using Distributions
+using PairPlots, ColorSchemes
+using LaTeXStrings
+using PumasUtilities: latexify
+using Latexify
+using PrettyTables
+
+pwd()
+cd("/Users/sandeepkg/Desktop/SOPHAS/PopPK Exercise/Week Assignments") 
+df = CSV.read("pain_relief.csv", DataFrame)
+df.logconc = ifelse.(ismissing.(df.Conc) .| (df.Conc .<= 0), missing, log.(df.Conc))
+Cmax = combine(groupby(df, :Subject), :Conc => (x -> maximum(skipmissing(x))) => :Cmax)
+df = outerjoin(Cmax, df, on = :Subject)
+
+df_active = select(df, :Subject, :Age, :Weight, :Dose, :Time, :Conc, :route, :cmt, :amt, :evid, :logconc, :Cmax)
+
+df_zero = @rsubset df :Time > 0
+
+df_clean = filter(row -> !ismissing(row.Conc), df)
+mean_df = @by df_clean [:Dose, :Time] begin
+    :mean_conc = mean(:Conc)
+    :std_conc = std(:Conc)
+    :sem_conc = std(:Conc) / sqrt(length(:Conc))
+    :n_subjects = length(unique(:Subject))
+end
+
+rng = Random.MersenneTwister(1234)
+```
+
+# **Complete PopPK Analysis Report**
+**Overview**
+
+This document presents a comprehensive population pharmacokinetic (PopPK) analysis of an investigational analgesic compound based on data from a clinical study. The report is structured to provide a clear and detailed account of the analysis process, including data exploration, non-compartmental analysis (NCA), model development, and model evaluation. Each section includes specific deliverables that summarize key findings and support the conclusions drawn from the analysis. The analysis was conducted using Pumas version 2.8.0, and all code used for data manipulation, modeling, and diagnostics is included in the appendices for transparency and reproducibility.
+
+# **Section 1: Introduction and Objectives**
+This analysis evaluates the pharmacokinetics of an investigational analgesic compound using data from a clinical study designed to characterize the concentration–time profile following drug administration. The study included adult subjects who received one of three active oral dose levels (5 mg, 20 mg, or 80 mg). Plasma drug concentrations were collected at multiple time points up to 8 hours post-dose. In addition to pharmacokinetic measurements, demographic variables such as age and body weight were recorded for each subject. 
+
+The primary objective of this analysis is to develop a population pharmacokinetic (PopPK) model that adequately describes the concentration–time data across all dose groups and quantifies inter-individual variability in pharmacokinetic parameters. Secondary objectives include exploratory data analysis, evaluation of dose proportionality using non-compartmental analysis, and identification of potential covariate relationships influencing drug disposition. All analyses were performed using the Pumas version 2.8.0.
+
+# **Section 2: Data Summary**
+## Dataset description
+The dataset consisted of pharmacokinetic observations from a clinical study evaluating an investigational analgesic compound. A total of 120 subjects were included, each receiving a single oral dose of 5 mg, 20 mg, or 80 mg. Plasma concentration measurements were collected at 12 predefined time points per subject: 0, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, and 8 hours post-dose.
+At time zero, concentration values were not recorded, resulting in 120 missing concentration values, which is expected for predose samples. Additionally, dose amounts were only recorded at time zero, leading to missing values in the dosing column for subsequent time points. Demographic variables including age and body weight were available for all subjects.
+
+## Demographics table
+The demographic characteristics of the study population were summarized by dose group. The mean age of subjects was 35 years (range: 18–55 years), with a balanced distribution across the three dose groups. The mean body weight was 73.4 kg (range: 40–110 kg), also evenly distributed among the dose groups. No significant differences in age or weight were observed between the dose groups, suggesting that demographic factors were well balanced across treatment arms.
+```{julia}
+#| echo: false
+#| fig-cap: "Table 1. Demographics Summary by Dose Group"
+table_one(df, [:Age, :Weight]; groupby = :Dose)
+```
+
+## Concentration summary 
+The concentration summary by time and dose group revealed distinct pharmacokinetic profiles across the three dose levels. There was decrease in the concentration with time across all dose groups, consistent with drug elimination. The 5 mg group showed lower mean concentrations and less variability compared to the 20 mg and 80 mg groups. Supported by the standard deviation values, as it increases with the dose. 
+```{julia}
+#| echo: false
+#| fig-cap: "Table 2. Concentration Summary by Time and Dose"
+conc_summary = summarytable(
+    df_zero,
+    :Conc => "Concentration (ng/mL)",
+    summary = [mean => "Mean", std => "σ", length => "n"],
+    rows = :Time => "Time (hours)",
+    cols = :Dose => "Dose group",
+)
+```
+
+## Data disposition
+Key observations from the data quality assessment include the following:
+*No missing values were identified in demographic variables (age, weight).
+*Missing values in concentration were confined to time = 0, as expected.
+*Concentration values ranged from the lower limit of quantification to the observed maximum without implausible values.
+
+Outlier detection (based on the IQR method) identified a total of 8 outliers across the dataset, with 3 outliers in the 5 mg and 80 mg groups, and 5 outliers in the 20 mg group. These outliers were retained for analysis as they may reflect true biological variability. No subjects were excluded, and no placebo group was present in the dataset.
+
+## Exploratory plots 
+### Spaghetti plot 
+The spaghetti plot of concentration versus time, stratified by dose group, revealed distinct pharmacokinetic profiles across the three dose levels. The 5 mg group exhibited lower peak concentrations compared to the 20 mg and 80 mg groups, which showed higher peaks and more prolonged concentrations. The variability in concentration-time profiles was evident within each dose group, with some subjects exhibiting higher or lower concentrations than the group mean. 
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 1. Spaghetti Plot of Concentration vs Time"
+df.DoseLabel = categorical(string.(df.Dose) .* " mg", levels = ["5 mg", "20 mg", "80 mg"], ordered=true)
+spaghetti_by_dose = data(df) *
+                    mapping(:Time, :Conc,
+                           color = :Subject => nonnumeric,
+                           layout = :DoseLabel => nonnumeric) *
+                    visual(Lines, linewidth = 1.5)
+
+fig_sphaghetti_by_dose = draw(spaghetti_by_dose, legend = (; show = false),
+                              axis = (xlabel = "Time (hours)", ylabel = "Concentration (mg/L)",
+                              ), figure = (title = "Spaghetti Plot ofConcentration vs Time", subtitle = "Faceted by Dose groups")
+)
+display(fig_sphaghetti_by_dose)
+```
+
+### Mean concentration-time profile with error bars
+The mean concentration-time profiles with standard deviation error bars further highlighted the dose-dependent increase in systemic exposure, with the 80 mg group showing the highest mean concentrations and greatest variability. The logarithmic scale on the y-axis of the spaghetti plot allowed for better visualization of the elimination phase of the drug, particularly for the lower dose groups. 
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 2. Mean Concentration–Time Profile by Dose with Standard Deviation Error Bars"
+cmax_df = combine(groupby(mean_df, :Dose)) do sdf
+    idx = argmax(sdf.mean_conc)
+    (
+        Cmax = sdf.mean_conc[idx],
+        Tmax = sdf.Time[idx]
+    )
+end
+set_theme!(Theme(
+    fontsize = 14,
+    Axis = (
+        xlabelsize = 16,
+        ylabelsize = 16,
+        xticklabelsize = 12,
+        yticklabelsize = 12,
+    )
+))
+publication_fig = Figure()
+ax = Axis(publication_fig[1, 1],
+    xlabel = "Time (h)",
+    ylabel = "Plasma Concentration (mg/L)",
+    title = "Mean Concentration–Time Profile by Dose with Standard Deviation Error Bars",
+)
+# Professional color palette
+colors = Makie.wong_colors()
+
+df_summary = combine(groupby(df_clean, [:Dose, :Time])) do sdf
+    (
+        mean_conc = mean(sdf.Conc),
+        sd_conc   = std(sdf.Conc),
+        n         = length(sdf.Conc)
+    )
+end
+
+dose_groups = sort(unique(df_summary.Dose))
+# Plot mean profiles
+for (i, d) in enumerate(dose_groups)
+    sdf = df_summary[df_summary.Dose .== d, :]
+
+    lines!(ax, sdf.Time, sdf.mean_conc,
+        color = colors[i],
+        linewidth = 3,
+        label = "Dose = $(d)"
+    )
+
+    # Confidence band (mean ± SD)
+    band!(ax,
+    collect(skipmissing(sdf.Time)),
+    collect(skipmissing(sdf.mean_conc .- sdf.sd_conc)),
+    collect(skipmissing(sdf.mean_conc .+ sdf.sd_conc)),
+    color = (colors[i], 0.2)
+)
+end
+# Cmax annotations
+for (i, d) in enumerate(dose_groups)
+    row = cmax_df[cmax_df.Dose .== d, :]
+
+    CairoMakie.scatter!(ax, row.Tmax, row.Cmax, color = colors[i], markersize = 10)
+
+    CairoMakie.text!(ax,
+        "Cmax",
+        position = (row.Tmax[1], row.Cmax[1]),
+        align = (:left, :bottom),
+        fontsize = 14,
+        color = :black
+    )
+end
+# Apparent terminal phase annotation - last 20% of time points for annotation
+tmax_all = maximum(df_summary.Time)
+terminal_start = 0.8 * tmax_all
+
+text!(ax,
+    "Apparent terminal\n phase",
+    position = (terminal_start, minimum(df_summary.mean_conc)),
+    align = (:left, :bottom),
+    fontsize = 14,
+    color = :black
+)
+# legend
+axislegend(ax, framevisible = false)
+
+publication_figure = publication_fig
+display(publication_figure)
+```
+
+# **Section 3: NCA Summary**
+## NCA Analysis
+Noncompartmental analysis demonstrated a clear increase in systemic exposure with increasing dose across the 5–80 mg range. Mean Cmax increased from 0.356 mg/L at 5 mg to 5.79 mg/L at 80 mg, while AUC∞ increased from 1.60 mg·h/L to 29.5 mg·h/L, indicating a strong dose–exposure relationship.
+
+The time to peak concentration (Tmax) remained consistent across all dose groups (~0.7 hours), suggesting that the rate of absorption is dose-independent. Similarly, elimination parameters were stable, with half-life ranging from 3.5 to 4.1 hours, apparent clearance (CL/F) between 2.95 and 3.52 L/h, and apparent volume of distribution (Vz/F) around 16.5 L. These findings indicate that the drug exhibits time-independent pharmacokinetics, with no evidence of dose-dependent changes in elimination.
+
+```{julia}
+#| echo: false
+#| fig-cap: "Table 3. NCA Parameters Summary by Dose Group"
+
+nca_pop = read_nca(df, 
+                   id = :Subject,
+                   time = :Time,
+                   observations = :Conc,
+                   amt = :amt,
+                   route = :route,
+                   group = [:Dose]
+)
+nca_results = run_nca(nca_pop, sigdigits = 4)
+nca_df = deepcopy(nca_results.reportdf)
+params = [:cmax => "Maximum Concentration (mg/L)", :tmax => "Time to Maximum Concentration (hours)", :auclast => "Area Under the Curve (last) (mg/L/hr)", :aucinf_obs => "Area Under the Curve (infinite) (mg/L/hr)", :half_life => "Half Life (hours)", :cl_f_obs => "Clearance (L/hr)", :vz_f_obs => "Volume of Distribution (L)"]
+summary_stat_table = table_one(nca_df, params; groupby = :Dose)
+display(summary_stat_table)
+```
+
+## Dose Proportionality Assessment - Cmax and AUC
+Dose proportionality was evaluated using regression analysis of dose-normalized exposure parameters. The regression for Cmax (Cmax/Dose = 0.000338 × Dose + 5.781) showed a near-zero slope, indicating that peak exposure remains proportional across doses. The estimated β for Cmax was approximately 1, confirming dose proportionality.
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 3. Dose proportionality assessment of Cmax"
+
+# Dose proportionality assessment using Cmax 
+power_model_cmax = DoseLinearityPowerModel(nca_results, :cmax, level = 0.90)
+power_plot_cmax = power_model(power_model_cmax)
+dose_norm_cmax = dose_vs_dose_normalized(nca_results, :cmax)
+display(dose_norm_cmax)
+```
+
+For AUC∞, the regression equation (AUC∞/Dose = 0.05647 × Dose + 24.88) showed a positive slope, indicating a slight increase in dose-normalized exposure with increasing dose. The β for AUC∞ was slightly greater than 1, suggesting mild supra-proportionality. These results indicate that at higher doses there is a chance of supra-proportionality, potentially due to saturation of elimination pathways or nonlinear absorption at higher concentrations.
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 4. Dose proportionality assessment of AUC∞"
+
+# Dose proportionality assessment using AUCinf_obs
+power_model_auc = DoseLinearityPowerModel(nca_results, :aucinf_obs, level = 0.90)
+power_plot_auc = power_model(power_model_auc)
+dose_norm_auc = dose_vs_dose_normalized(nca_results, :aucinf_obs)
+display(dose_norm_auc)
+```
+
+```{julia}
+#| echo: false
+#| fig-cap: "Table 4. Dose Proportionality Assessment Summary"
+beta_table = DataFrame(coeftable(power_model_cmax))
+auc_table = DataFrame(coeftable(power_model_auc))
+dose_prop_table = DataFrame(
+    Parameter = ["Cmax", "AUC"],
+    Beta = [beta_table.Estimate[1], auc_table.Estimate[1]],
+    Lower90CI = [beta_table[1, 3], auc_table[1, 3]],
+    Upper90CI = [beta_table[1, 4], auc_table[1, 4]]
+)
+
+pretty_table(dose_prop_table)
+```
+
+Superposition-based simulations of multiple dosing showed predictable accumulation consistent with the observed half-life. Twice-daily (BID) dosing at 100 mg resulted in approximately 11% higher steady-state peak concentrations compared to once-daily (QD) dosing, reflecting expected accumulation under more frequent dosing. Overall, steady-state exposure metrics (Cmax,ss, Cavg,ss, and Cmin,ss) were consistent with linear pharmacokinetic behavior and did not indicate unexpected drug accumulation.
+
+A quality assessment of the NCA results was performed using the following criteria:
+
+- Adjusted R² of terminal slope (rsq_adj_kel ≥ 0.8)
+- Extrapolated AUC percentage (auc_extrap_obs ≤ 20%)
+- Number of samples for λz estimation (n_samples_kel ≥ 3)
+
+All subjects met the criteria for rsq_adj_kel and n_samples_kel, indicating that the terminal elimination phase was well characterized and supported by sufficient data. However, 54 subjects (45%) exhibited auc_extrap_obs > 20%, suggesting that a notable portion of total exposure (AUC∞) was extrapolated rather than directly observed.
+A subset of subjects (IDs: 32, 94, 64, 100, and 104) showed markedly high extrapolation (>40%) and were identified as outliers. While λz-related parameters are considered reliable across the dataset, elevated extrapolation indicates reduced reliability of AUC∞ in affected individuals. Therefore, subjects with auc_extrap_obs > 40% (IDs: 32, 94, 100, and 104) are to be monitored on due to unreliable exposure estimates.
+
+# **Section 4: Model Development**
+
+## Base Structural Model Selection
+The development of the population pharmacokinetic model began with the evaluation of candidate structural models to adequately describe the concentration–time data.
+The initial estimates for the model development was based on the NCA results, where the clearance, volumen of distribution, and absorption rate constant were estimated based on the observed data. These estimates provided a starting point for the model fitting process and informed the selection of initial parameter values for the structural models. The IIV estimates were initially set to 30% for all parameters and the resiudal unexplained error was initially set to 20%, which is a common starting point for pharmacokinetic modeling. These initial estimates were refined iteratively based on model fit and diagnostic evaluations throughout the model development process.
+
+```{julia}
+#| echo: false
+mean_cl = round(mean(skipmissing(nca_df.cl_f_obs)), digits = 3)
+println("Initial Clearance = ", mean_cl, " ml/min")
+
+mean_vz = round(mean(skipmissing(nca_df.vz_f_obs)), digits = 3)
+println("Initial Volume of Distribution = ", mean_vz, " Litres")
+
+Ka_individual = 1.0 ./ nca_df.tmax
+ka = round(mean(skipmissing(Ka_individual)), digits = 3)
+println("Initial Absorption Rate constant = ", ka, " hr^-1")
+```
+
+Both one-compartment and two-compartment models were investigated, with consideration given to the route of administration and the observed pharmacokinetic profile.
+Initial exploration included a one-compartment model with first-order elimination, followed by a one-compartment model incorporating first-order absorption to reflect oral dosing. Later, a one-compartment model with inter-individual variability (IIV) on clearance and volume parameters was evaluated to capture between-subject differences. From the tested models, one-compartment models with IIV provided improved fits compared to simpler models, as evidenced by reductions in objective function value (OFV) and improved diagnostic plots. 
+
+Additionally, various residual error models were assessed, including additive, proportional, and combined (additive plus proportional) error structures. From which, combined error models consistently provided superior fits, as they accounted for both constant and concentration-dependent variability in the data. The combined error model demonstrated improved goodness-of-fit diagnostics, with homoscedastic residuals and reduced bias across the concentration range.
+
+At this stage, one compartment model with IIV and combined error model was selected as the best one-compartment model, as it provided the best fit among the one-compartment models. However, the observed data suggested that a two-compartment model may better capture the distribution phase and biphasic decline in concentrations.
+
+```{julia}
+#| echo: false
+#| output: false
+
+df_model = @select df_active begin
+    :ID = :Subject
+    :TIME = :Time
+    :EVID = :evid
+    :DOSE = :amt
+    :Dose_mg = :Dose
+    :CMT = :cmt
+    :dv = :Conc
+    :ROUTE = :route
+    :AGE = :Age
+    :WT = :Weight
+end
+
+pop = read_pumas(
+    df_model;
+    id = :ID,
+    time = :TIME,
+    evid = :EVID,
+    amt = :DOSE,
+    cmt = :CMT,
+    route = :ROUTE,
+    covariates = [:AGE, :WT, :Dose_mg],
+    observations = [:dv]
+)
+
+om_cl, om_vl, om_ka = 0.09, 0.09, 0.09
+
+# One-compartment model with first-order elimination
+one_comp_ke_model = @model begin
+    @metadata begin
+        desc = "One Compartment Model - First Order Elimination"
+        timeu = u"minute"
+    end
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)
+        tvvc ∈ RealDomain(lower = 0.001)
+        σ ∈ RealDomain(lower = 0.001)
+    end
+
+    @pre begin
+        Cl = tvcl
+        Vc = tvvc
+    end
+
+    @dynamics begin
+        Central' = -(Cl / Vc) * Central
+    end
+
+    @derived begin
+        cp := @. Central / Vc
+        dv ~ @. Normal(cp, σ)
+    end
+end
+
+# Initial parameters for the one-compartment model with first-order elimination
+init_params_ke = (tvcl = mean_cl, tvvc = mean_vz, σ = 0.2)
+
+# One-Compartment Model  - First-order absorption (Ka)
+one_comp_ka_model = @model begin
+    @metadata begin
+        desc = "One-compartment model with first-order absorption"
+    end
+
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)     
+        tvvc ∈ RealDomain(lower = 0.001)      
+        tvka ∈ RealDomain(lower = 0.001)     
+        σ ∈ RealDomain(lower = 0.001)        
+    end
+
+    @pre begin
+        CL = tvcl 
+        Vc = tvvc 
+        Ka = tvka 
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/Vc) * Central
+    end
+    
+    @derived begin
+        cp := @. (Central / Vc)
+        dv ~ @. Normal(cp, abs(cp) * σ)
+    end
+end
+
+# Initial parameters for the one-compartment model with first-order absorption
+init_params_ka = (
+    tvcl = mean_cl,
+    tvvc = mean_vz,
+    tvka = ka,
+    σ = 0.2
+)
+
+# One-Compartment Model - IIV on CL, V, Ka
+one_comp_model_iiv = @model begin
+    @metadata begin
+        desc = "One-compartment model with first-order absorption"
+    end
+
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)      
+        tvvc ∈ RealDomain(lower = 0.001)     
+        tvka ∈ RealDomain(lower = 0.001)     
+        Ω ∈ PDiagDomain(3)              
+        σ ∈ RealDomain(lower = 0.001)         
+    end
+    
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V = tvvc * exp(η[2])
+        Ka = tvka * exp(η[3])
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V) * Central
+    end
+    
+    @derived begin
+        cp := @. Central / V
+        dv ~ @. Normal(cp, abs(cp) * σ) 
+    end
+end
+
+# Intial parameters for the one-compartment model with IIV on CL, V, Ka
+init_params_iiv = (
+    tvcl = mean_cl,
+    tvvc = mean_vz,
+    tvka = ka,
+    Ω = Diagonal([om_cl, om_vl, om_ka]), 
+    σ = 0.2
+)
+
+# One Compartment Model with Additive error: DV ~ Normal(IPRED, sigma_add)
+one_comp_model_add_error = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)
+        tvv ∈ RealDomain(lower = 0.001)
+        tvka ∈ RealDomain(lower = 0.001)
+        Ω ∈ PDiagDomain(3)
+        σ_add ∈ RealDomain(lower = 0.001)   
+    end
+
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+    
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V = tvv * exp(η[2])
+        Ka = tvka * exp(η[3])
+    end
+
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V) * Central
+    end
+
+    @derived begin
+        cp := @. Central / V
+        dv ~ @. Normal(cp, σ_add)
+    end
+end
+
+init_params_add_error = (
+    tvcl = mean_cl,
+    tvv = mean_vz,
+    tvka = ka,
+    Ω = Diagonal([om_cl, om_vl, om_ka]),
+    σ_add = 0.15
+)
+
+# One compartment model with Proportional error: DV ~ Normal(IPRED, IPRED * sigma_prop)
+one_comp_model_prop_error = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)
+        tvv ∈ RealDomain(lower = 0.001)
+        tvka ∈ RealDomain(lower = 0.001)
+        Ω ∈ PDiagDomain(3)
+        σ_prop ∈ RealDomain(lower = 0.001)  
+    end
+
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+    
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V = tvv * exp(η[2])
+        Ka = tvka * exp(η[3])
+    end
+
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V) * Central
+    end
+
+    @derived begin
+        cp := @. Central / V
+        dv ~ @. Normal(cp, (cp * σ_prop))
+    end
+end
+
+# Initial parameters for the one-compartment model with proportional error
+init_params_prop_error = (
+    tvcl = mean_cl,
+    tvv = mean_vz,
+    tvka = ka,
+    Ω = Diagonal([om_cl, om_vl, om_ka]),
+    σ_prop = 0.20
+)
+
+one_comp_model_combined_error = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)
+        tvv ∈ RealDomain(lower = 0.001)
+        tvka ∈ RealDomain(lower = 0.001)
+        Ω ∈ PDiagDomain(3)
+        σ_add ∈ RealDomain(lower = 0.001)   # Additive error
+        σ_prop ∈ RealDomain(lower = 0.001)  # Proportional error
+    end
+
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V = tvv * exp(η[2])
+        Ka = tvka * exp(η[3])
+    end
+
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V) * Central
+    end
+
+    @derived begin
+        cp := @. Central / V
+        dv ~ @. Normal(cp, sqrt(σ_add^2 + (cp * σ_prop)^2))
+    end
+end
+
+# Initial parameters for the one-compartment model with combined error
+init_params_2_error = (
+    tvcl = mean_cl,
+    tvv = mean_vz,
+    tvka = ka,
+    Ω = Diagonal([om_cl, om_vl, om_ka]),
+    σ_add = 0.05, # Additive error 
+    σ_prop = 0.1 # Proportional error 
+)
+
+# Fitting of the models
+fit_one_comp_ke = fit(one_comp_ke_model, pop, init_params_ke, NaivePooled())
+fit_one_comp_ka = fit(one_comp_ka_model, pop, init_params_ka, NaivePooled())
+fit_one_comp_iiv = fit(one_comp_model_iiv, pop, init_params_iiv, FOCE())
+fit_one_comp_add_error = fit(one_comp_model_add_error, pop, init_params_add_error, FOCE())
+fit_one_comp_prop_error = fit(one_comp_model_prop_error, pop, init_params_prop_error, FOCE())
+fit_one_comp_2_error = fit(one_comp_model_combined_error, pop, init_params_2_error, FOCE())
+```
+
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 5. Simulation of One-Compartment Model with IIV on CL, V, Ka"
+
+# One-Compartment Model - IIV on CL, V, Ka
+one_comp_model_iiv = @model begin
+    @metadata begin
+        desc = "One-compartment model with first-order absorption"
+    end
+
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)      
+        tvvc ∈ RealDomain(lower = 0.001)     
+        tvka ∈ RealDomain(lower = 0.001)     
+        Ω ∈ PDiagDomain(3)              
+        σ ∈ RealDomain(lower = 0.001)         
+    end
+    
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V = tvvc * exp(η[2])
+        Ka = tvka * exp(η[3])
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V) * Central
+    end
+    
+    @derived begin
+        cp := @. Central / V
+        dv ~ @. Normal(cp, abs(cp) * σ) 
+    end
+end
+
+# Intial parameters for the one-compartment model with IIV on CL, V, Ka
+init_params_iiv = (
+    tvcl = mean_cl,
+    tvvc = mean_vz,
+    tvka = ka,
+    Ω = Diagonal([om_cl, om_vl, om_ka]), 
+    σ = 0.2
+)
+
+# Simulation Plot for One-Compartment Model - IIV on CL, V, Ka
+sim_one_comp_iiv = simobs(one_comp_model_iiv, pop, init_params_iiv, rng = rng)
+sim_plot_one_cmp_iiv = sim_plot(one_comp_model_iiv, sim_one_comp_iiv; observations = [:dv])
+sim_iiv_df = DataFrame(sim_one_comp_iiv)
+sim_iiv = data(sim_iiv_df) * mapping(:time, :dv, color = :id => "", ) * visual(Lines, linewidth = 2, alpha = 0.7)
+sim_iiv_plot = draw(sim_iiv; axis = (xlabel = "Time (hr)", ylabel = "Concentratiob (mg/L)", title = "Simulation of One Compartment Model",
+subtitle = "Interindividual variability on Cl, V, Ka",),
+    figure = (; fontsize = 16),
+    legend = (position = :bottom, show = false,),
+)
+display(sim_iiv_plot)
+```
+
+Subsequently, a two-compartment model with first-order absorption was evaluated. This model provided a substantially improved fit to the data, particularly in capturing the biphasic decline observed in the concentration–time profiles. The inclusion of a peripheral compartment allowed for a more accurate representation of drug distribution, resulting in improved agreement between observed and predicted concentrations across all time points. Then inter-individual variability was added to the two-compartment model, which further enhanced the fit and provided a more realistic representation of variability in pharmacokinetic parameters across subjects. later, combined error model was added to the two-compartment model, which further improved the fit and provided a more accurate representation of residual variability. The two-compartment model with IIV and two-compartment model with IIV and combined error structure demonstrated the best overall fit, as evidenced by the lowest OFV, improved AIC and BIC values, and superior diagnostic plots. 
+
+```{julia}
+#| echo: false
+#| output: false
+# Two-compartment model with first-order absorption 
+two_comp_model_ka = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)      
+        tvv1 ∈ RealDomain(lower = 0.001)      
+        tvq ∈ RealDomain(lower = 0.001)       
+        tvv2 ∈ RealDomain(lower = 0.001)      
+        tvka ∈ RealDomain(lower = 0.001)                     
+        σ ∈ RealDomain(lower = 0.001)         
+    end
+    
+    @pre begin
+        CL = tvcl 
+        V1 = tvv1 
+        Q = tvq 
+        V2 = tvv2 
+        Ka = tvka 
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V1) * Central - (Q/V1) * Central + (Q/V2) * Peripheral
+        Peripheral' = (Q/V1) * Central - (Q/V2) * Peripheral
+    end
+    
+    @derived begin
+        cp := @. Central / V1
+        dv ~ @. Normal(cp, abs(cp) * σ)
+    end
+end
+
+# Initial parameters for the two-compartment model with first-order absorption
+init_param_two_comp_ka = (
+    tvcl = mean_cl,              # Start from 1-cmt estimates
+    tvv1 = mean_vz * 0.7,         # Central volume (smaller than 1-cmt V)
+    tvq = mean_cl * 0.5,         # Inter-compartmental clearance
+    tvv2 = mean_vz * 0.3,         # Peripheral volume
+    tvka = ka,             
+    σ = 0.2
+)
+
+# Two Compartment model with IIV on CL, Vc, Ka
+two_comp_iiv_model = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)      # Central clearance
+        tvv1 ∈ RealDomain(lower = 0.001)      # Central volume
+        tvq ∈ RealDomain(lower = 0.001)       # Inter-compartmental clearance
+        tvv2 ∈ RealDomain(lower = 0.001)      # Peripheral volume
+        tvka ∈ RealDomain(lower = 0.001)      # Absorption rate
+        Ω ∈ PDiagDomain(5)                    # IIV covariance matrix
+        σ ∈ RealDomain(lower = 0.001)         # Proportional error
+    end
+    
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+    
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V1 = tvv1 * exp(η[2])
+        Q = tvq * exp(η[3])
+        V2 = tvv2 * exp(η[4])
+        Ka = tvka * exp(η[5])
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V1) * Central - (Q/V1) * Central + (Q/V2) * Peripheral
+        Peripheral' = (Q/V1) * Central - (Q/V2) * Peripheral
+    end
+    
+    @derived begin
+        cp := @. Central / V1
+        dv ~ @. Normal(cp, abs(cp) * σ)
+    end
+end
+
+# Initial parameters for the two-compartment model with IIV on CL, Vc, Ka
+init_param_two_iiv = (
+    tvcl = mean_cl,              
+    tvv1 = mean_vz * 0.7,         
+    tvq = mean_cl * 0.5,         
+    tvv2 = mean_vz * 0.3,        
+    tvka = ka,              
+    Ω = Diagonal([0.09, 0.09, 0.09, 0.09, 0.09]),  
+    σ = 0.20
+)
+
+# Two Compartment model with Best error model from one compartment model (Combined error model)
+two_comp_comb_error_model = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)     
+        tvv1 ∈ RealDomain(lower = 0.001)     
+        tvq ∈ RealDomain(lower = 0.001)      
+        tvv2 ∈ RealDomain(lower = 0.001)      
+        tvka ∈ RealDomain(lower = 0.001)      
+        Ω ∈ PDiagDomain(5)                    
+        σ_add ∈ RealDomain(lower = 0.0001)  
+        σ_prop ∈ RealDomain(lower = 0.0001)  
+    end
+    
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V1 = tvv1 * exp(η[2])
+        Q = tvq * exp(η[3])
+        V2 = tvv2 * exp(η[4])
+        Ka = tvka * exp(η[5])
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V1) * Central - (Q/V1) * Central + (Q/V2) * Peripheral
+        Peripheral' = (Q/V1) * Central - (Q/V2) * Peripheral
+    end
+    
+    @derived begin
+        cp := @. Central / V1
+        dv ~ @. Normal(cp, sqrt(σ_add^2 + (cp * σ_prop)^2))
+    end
+end
+
+# Initial parameters for the two-compartment model with combined error
+init_param_two_comb_error = (
+    tvcl = mean_cl,              # Start from 1-cmt estimates
+    tvv1 = mean_vz * 0.7,         # Central volume (smaller than 1-cmt V)
+    tvq = mean_cl * 0.5,         # Inter-compartmental clearance
+    tvv2 = mean_vz * 0.3,         # Peripheral volume
+    tvka = ka,
+    Ω = Diagonal([0.09, 0.09, 0.09, 0.09, 0.09]), 
+    σ_add = 0.05,
+    σ_prop = 0.1
+)
+
+
+# Fitting of the two-compartment models
+fit_two_ka = fit(two_comp_model_ka, pop, init_param_two_comp_ka, NaivePooled())
+fit_two_iiv = fit(two_comp_iiv_model, pop, init_param_two_iiv, FOCE())
+fit_two_comb_error = fit(two_comp_comb_error_model, pop, init_param_two_comb_error, FOCE())
+```
+
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 6. Simulation of Two Compartment Model with IIV on CL, Vc, Ka"
+
+sim_two_comp_iiv = simobs(two_comp_iiv_model, pop, init_param_two_iiv, rng = rng)
+sim_two_comp_iiv_df = DataFrame(sim_two_comp_iiv)
+sim_two_comp_iiv = data(sim_two_comp_iiv_df) * mapping(:time, :dv, color = :id => "", ) * visual(Lines, linewidth = 2, alpha = 0.7)
+sim_two_comp_iiv_plot = draw(sim_two_comp_iiv; axis = (xlabel = "Time (hr)", ylabel = "Concentratiob (mg/L)", title = "Simulation of Two Compartment Model",
+subtitle = "Interindividual variability on CL, Vc, Ka",),
+    figure = (; fontsize = 16),
+    legend = (position = :bottom, show = false,),
+)
+```
+
+Based on these evaluations, the two-compartment model with first-order absorption with IIV and two-compartment model with first-order absorption with IIV having a combined residual error structure were the two best models. The final selection between these two models was based on a comprehensive assessment of model fit, parsimony, and biological plausibility. Two-compartment model with IIV has the lowest BIC compared to combined error model which is useful in selecting the simplest model. In terms of AIC and ΔOFV, Two compartment model with IIV is as close to the two compartment model with combined error model. The two-compartment model with IIV was ultimately selected as the final structural model, as it provided the best balance between goodness-of-fit and model complexity. 
+
+Following the selection of the base structural model, inter-individual variability (IIV) was incorporated to account for differences in pharmacokinetic parameters across subjects. Initially, a full IIV model was implemented, with exponential random effects included on all primary parameters: clearance (CL), central volume of distribution (V1), intercompartmental clearance (Q), peripheral volume of distribution (V2), and absorption rate constant (Ka).
+
+The inclusion of IIV significantly improved the model fit, as evidenced by reductions in OFV and improved agreement between observed and predicted concentrations. However, further refinement of the random effects structure was undertaken to achieve a parsimonious model while maintaining adequate descriptive performance.
+A stepwise reduction approach was employed, whereby individual random effects were evaluated for their contribution to model performance. Parameters associated with high shrinkage were considered for removal in the order of V2, ka, and Q. During this process, it was observed that the inclusion of IIV on the peripheral volume of distribution (V2) did not meaningfully improve model fit and contributed to increased parameter uncertainty.
+
+Removal of IIV on V2 resulted in improved model stability and parameter precision without compromising goodness-of-fit. Consequently, the final random effects structure retained IIV on intercompartmental clearance (Q), and absorption rate constant (Ka), while excluding IIV on V2. This refined structure achieved an appropriate balance between model complexity and robustness, ensuring reliable parameter estimation while adequately capturing inter-individual variability.
+
+```{julia}
+#| echo: false
+#| output: false
+
+# Two compartment model without random effect on v2
+two_comp_iiv_diag_v2 = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)     
+        tvv1 ∈ RealDomain(lower = 0.001)      
+        tvq ∈ RealDomain(lower = 0.001)     
+        tvv2 ∈ RealDomain(lower = 0.001)      
+        tvka ∈ RealDomain(lower = 0.001)      
+        Ω ∈ PDiagDomain(4)                    
+        σ ∈ RealDomain(lower = 0.001)         
+    end
+    
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+    
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V1 = tvv1 * exp(η[2])
+        Q = tvq * exp(η[3])
+        V2 = tvv2 
+        Ka = tvka * exp(η[4])
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V1) * Central - (Q/V1) * Central + (Q/V2) * Peripheral
+        Peripheral' = (Q/V1) * Central - (Q/V2) * Peripheral
+    end
+    
+    @derived begin
+        cp := @. Central / V1
+        dv ~ @. Normal(cp, abs(cp) * σ)
+    end
+end
+
+init_param_two_iiv_diag_v2 = (
+    tvcl = mean_cl,              
+    tvv1 = mean_vz * 0.7,         
+    tvq = mean_cl * 0.5,         
+    tvv2 = mean_vz * 0.3,       
+    tvka = ka,             
+    Ω = Diagonal([0.09, 0.09, 0.09, 0.09]),  
+    σ = 0.2
+)
+
+
+# Two compartment model without random effect on ka
+two_comp_iiv_diag_ka = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)      
+        tvv1 ∈ RealDomain(lower = 0.001)      
+        tvq ∈ RealDomain(lower = 0.001)     
+        tvv2 ∈ RealDomain(lower = 0.001)     
+        tvka ∈ RealDomain(lower = 0.001)     
+        Ω ∈ PDiagDomain(4)                    
+        σ ∈ RealDomain(lower = 0.001)         
+    end
+    
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+    
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V1 = tvv1 * exp(η[2])
+        Q = tvq * exp(η[3])
+        V2 = tvv2 * exp(η[4])
+        Ka = tvka  
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V1) * Central - (Q/V1) * Central + (Q/V2) * Peripheral
+        Peripheral' = (Q/V1) * Central - (Q/V2) * Peripheral
+    end
+    
+    @derived begin
+        cp := @. Central / V1
+        dv ~ @. Normal(cp, abs(cp) * σ)
+    end
+end
+
+init_param_two_iiv_diag_ka = (
+    tvcl = mean_cl,              
+    tvv1 = mean_vz * 0.7,        
+    tvq = mean_cl * 0.5,        
+    tvv2 = mean_vz * 0.3,        
+    tvka = ka,            
+    Ω = Diagonal([0.09, 0.09, 0.09, 0.09]),  
+    σ = 0.2
+)
+
+# Two compartment model without random effect on Q
+two_comp_iiv_diag_q = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001)      
+        tvv1 ∈ RealDomain(lower = 0.001)      
+        tvq ∈ RealDomain(lower = 0.001)     
+        tvv2 ∈ RealDomain(lower = 0.001)      
+        tvka ∈ RealDomain(lower = 0.001)     
+        Ω ∈ PDiagDomain(4)                    
+        σ ∈ RealDomain(lower = 0.001)         
+    end
+    
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+    
+    @pre begin
+        CL = tvcl * exp(η[1])
+        V1 = tvv1 * exp(η[2])
+        Q = tvq
+        V2 = tvv2 * exp(η[3])
+        Ka = tvka * exp(η[4])
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/V1) * Central - (Q/V1) * Central + (Q/V2) * Peripheral
+        Peripheral' = (Q/V1) * Central - (Q/V2) * Peripheral
+    end
+    
+    @derived begin
+        cp := @. Central / V1
+        dv ~ @. Normal(cp, abs(cp) * σ)
+    end
+end
+
+init_param_two_iiv_diag_q = (
+    tvcl = mean_cl,
+    tvv1 = mean_vz * 0.7,
+    tvq = mean_cl * 0.5,
+    tvv2 = mean_vz * 0.3,
+    tvka = ka,
+    Ω = Diagonal([0.09, 0.09, 0.09, 0.09]),  
+    σ = 0.2
+)
+
+# Fitting of the two-compartment models without random effects 
+fit_two_iiv_diag_v2 = fit(two_comp_iiv_diag_v2, pop, init_param_two_iiv_diag_v2, FOCE())
+fit_two_iiv_diag_q = fit(two_comp_iiv_diag_q, pop, init_param_two_iiv_diag_q, FOCE())
+fit_two_iiv_diag_ka = fit(two_comp_iiv_diag_ka, pop, init_param_two_iiv_diag_ka, FOCE())
+```
+
+## Model comparison and selection
+All models with OFV, AIC, BIC, parameters
+A comprehensive comparison of candidate models was performed using statistical criteria, including objective function value (OFV), Akaike Information Criterion (AIC), and Bayesian Information Criterion (BIC). These metrics were used to assess model fit while accounting for model complexity.
+Comparison across one-compartment and two-compartment models demonstrated that the two-compartment models consistently provided superior fits, as indicated by lower OFV and AIC values. Although more complex models, such as the two-compartment model with IIV, yielded slightly improved OFV and AIC than the two-compartment model with IIV having combined error, the differences were not substantial when compared to simpler alternatives.
+
+The Bayesian Information Criterion (BIC), which imposes a stronger penalty for model complexity, identified the two-compartment model with inter-individual variability as the optimal model. This model achieved the lowest BIC value, indicating that it provided the best balance between goodness-of-fit and parsimony. The selected model adequately described both the absorption and distribution phases, as well as the elimination profile. 
+
+From a biological perspective, the two-compartment structure is consistent with the expected pharmacokinetic behavior of small-molecule drugs, which typically distribute between central (plasma) and peripheral tissues. The observed biexponential decline in concentration further supports this structural choice.
+
+After analysing the effect of the random effects, the final population pharmacokinetic model was defined as a two-compartment model with first-order absorption with inter-individual variability (IIV). Inter-individual variability was included on clearance (CL), central volume of distribution (V1), intercompartmental clearance (Q), and absorption rate constant (Ka), while IIV on peripheral volume (V2) was excluded.
+
+Model parameters were estimated using the First-Order Conditional Estimation (FOCE) method. The final model provided a robust and biologically plausible description of the pharmacokinetic data, with good agreement between observed and predicted concentrations and no evidence of systematic bias.
+Overall, the selected model was considered suitable for further analyses, including covariate evaluation and simulation studies.
+
+```{julia}
+#| echo: false
+#| fig-cap: "Table 5. Model Comparison Summary"
+model_comparison = DataFrame(
+    Model = ["One Compartment Model - Ke", "One Compartment Model - Ka", "One Compartment Model - IIV", "One Compartment Model - Additive error", "One Compartment Model - Proportional error", "One Compartment Model - Combined error", "Two Compartment Model - Ka", "Two Compartment Model - IIV", "Two Compartment Model - combined error", "Two Compartment Model - No IIV on V2", "Two Compartment Model - No IIV on Q", "Two Compartment Model - No IIV on Ka"],
+    LogLikelihood = [
+        loglikelihood(fit_one_comp_ke),
+        loglikelihood(fit_one_comp_ka),
+        loglikelihood(fit_one_comp_iiv),
+        loglikelihood(fit_one_comp_add_error),
+        loglikelihood(fit_one_comp_prop_error),
+        loglikelihood(fit_one_comp_2_error),
+        loglikelihood(fit_two_ka),
+        loglikelihood(fit_two_iiv),
+        loglikelihood(fit_two_comb_error),
+        loglikelihood(fit_two_iiv_diag_v2),
+        loglikelihood(fit_two_iiv_diag_q),
+        loglikelihood(fit_two_iiv_diag_ka)
+    ],
+    AIC = [
+        aic(fit_one_comp_ke),
+        aic(fit_one_comp_ka),
+        aic(fit_one_comp_iiv),
+        aic(fit_one_comp_add_error),
+        aic(fit_one_comp_prop_error),
+        aic(fit_one_comp_2_error),
+        aic(fit_two_ka),
+        aic(fit_two_iiv),
+        aic(fit_two_comb_error),
+        aic(fit_two_iiv_diag_v2),
+        aic(fit_two_iiv_diag_q),
+        aic(fit_two_iiv_diag_ka)
+    ],
+    BIC = [
+        bic(fit_one_comp_ke),
+        bic(fit_one_comp_ka),
+        bic(fit_one_comp_iiv),
+        bic(fit_one_comp_add_error),
+        bic(fit_one_comp_prop_error),
+        bic(fit_one_comp_2_error),
+        bic(fit_two_ka),
+        bic(fit_two_iiv),
+        bic(fit_two_comb_error),
+        bic(fit_two_iiv_diag_v2),
+        bic(fit_two_iiv_diag_q),
+        bic(fit_two_iiv_diag_ka)
+    ]
+)
+
+model_comparison.OFV = -2 .* model_comparison.LogLikelihood
+
+# Find best model
+best_AIC = minimum(model_comparison.AIC)
+best_BIC = minimum(model_comparison.BIC)
+best_OFV = minimum(model_comparison.OFV)
+
+# Calculate deltas
+model_comparison.ΔAIC = model_comparison.AIC .- best_AIC
+model_comparison.ΔBIC = model_comparison.BIC .- best_BIC
+model_comparison.ΔOFV = model_comparison.OFV .- best_OFV
+
+pretty_table(model_comparison; crop = :none)
+```
+
+
+# **Section 5: Final Model**
+## Model structure
+
+The pharmacokinetic data was described using a two-compartment model with first-order absorption. The model includes three compartments:
+- Depot (site of absorption)
+- Central compartment
+- Peripheral compartment
+The drug is absorbed from the depot into the central compartment with rate constant (Ka). From the central compartment, the drug is eliminated by clearance (CL) and distributed to the peripheral compartment through intercompartmental clearance (Q). Interindividual variability was included for CL, VC, Q, and Ka using an exponential model, while VP it was excluded. The following equations describe how the drug amount changes over time in each compartment due to absorption, distribution, and elimination.
+
+```{julia}
+#| echo: false
+final_model = @model begin
+    @param begin
+        tvcl ∈ RealDomain(lower = 0.001,  init = mean_cl)      
+        tvvc ∈ RealDomain(lower = 0.001,  init = mean_vz * 0.7)      
+        tvq ∈ RealDomain(lower = 0.001,  init = mean_cl * 0.5)     
+        tvvp ∈ RealDomain(lower = 0.001,  init = mean_vz * 0.3)      
+        tvka ∈ RealDomain(lower = 0.001,  init = ka)     
+        Ω ∈ PDiagDomain(4, init = Diagonal([0.09, 0.09, 0.09, 0.09]))                    
+        σ ∈ RealDomain(lower = 0.001,  init = 0.2)         
+    end
+    
+    @random begin
+        η ~ MvNormal(Ω)
+    end
+    
+    @pre begin
+        CL = tvcl * exp(η[1])
+        VC = tvvc * exp(η[2])
+        Q = tvq * exp(η[3])
+        VP = tvvp 
+        Ka = tvka * exp(η[4])
+    end
+    
+    @dynamics begin
+        Depot' = -Ka * Depot
+        Central' = Ka * Depot - (CL/VC) * Central - (Q/VC) * Central + (Q/VP) * Peripheral
+        Peripheral' = (Q/VC) * Central - (Q/VP) * Peripheral
+    end
+    
+    @derived begin
+        cp := @. Central / VC
+        dv ~ @. Normal(cp, abs(cp) * σ)
+    end
+end
+
+blocks = [:pre, :dynamics] 
+
+model_representation = Latexify.LaTeXString(
+    join([latexify(final_model, block, index = :bracket, snakecase = true) for
+            block in blocks
+        ],
+        "\n\n", 
+    ),
+);
+
+model_representation
+```
+
+The final population pharmacokinetic model parameter estimates are presented in Table X. The model parameters were estimated with generally good precision, as indicated by low relative standard errors (RSE) and narrow confidence intervals.
+
+### Fixed Effects
+The typical value of clearance (CL) was estimated at 2.543 L/hr with good precision (RSE 5.2%), indicating reliable characterization of drug elimination. The central volume of distribution (V1) was estimated at 11.443 Litres with high precision (RSE 2.3%). Intercompartmental clearance (Q) and peripheral volume (V2) were estimated at 1.337 L/hr(RSE 6.3%) and 9.605 Litres (RSE 17.2%), respectively, with V2 showing relatively higher uncertainty. The absorption rate constant (Ka) was estimated at 5.005 (RSE 7.3%), suggesting adequate description of the absorption phase.
+
+### Random Effects
+Interindividual variability was moderate for clearance (Ω = 0.141) and central volume (Ω = 0.059), while higher variability was observed for peripheral volume (Ω = 0.216) and absorption rate constant (Ω = 0.437), indicating notable differences in distribution and absorption across individuals.
+
+### Residual Variability
+The residual unexplained variability (σ) was low (0.05) and precisely estimated (RSE 2.5%), indicating a good fit of the model to the observed data.
+
+```{julia}
+#| echo: false
+#| fig-cap: "Table 5. Final Parameter Estimates for Two-Compartment Model with IIV"
+infer_diag_v2 = infer(fit_two_iiv_diag_v2)
+coef_table_diag_v2_df = coefficients_table(fit_two_iiv_diag_v2, infer_diag_v2)
+pretty_table(coef_table_diag_v2_df; crop = :none)
+```
+
+## Secondary parameters (CL, V in appropriate units)
+A terminal half-life of ~9 hours, suggesting moderate elimination. Rapid distribution phase (~1.7 hr). Moderate total distribution (Vss ≈ 21 L). Exposure (AUC) directly proportional to dose and inversely related to clearance.
+
+```{julia}
+#| echo: false
+# Given parameter estimates
+CL  = 2.543      
+V1  = 11.443     
+Q   = 1.337      
+V2  = 9.605      
+Ka  = 5.005      
+
+# Calculate rate constants
+k10 = CL / V1
+k12 = Q / V1
+k21 = Q / V2
+
+# Calculate hybrid rate constants (alpha and beta)
+A = k10 + k12 + k21
+B = k10 * k21
+
+alpha = (A + sqrt(A^2 - 4B)) / 2
+beta  = (A - sqrt(A^2 - 4B)) / 2
+
+# Half-lives
+t_half_alpha = log(2) / alpha
+t_half_beta  = log(2) / beta
+
+# Volume of distribution at steady state
+Vss = V1 + V2
+
+# Mean residence time
+MRT = Vss / CL
+
+# AUC for unit dose (Dose = 1 mg)
+Dose = 1.0
+AUC = Dose / CL
+
+# Print results
+println("k10 = ", round(k10, digits = 2), " hr^-1")
+println("k12 = ", round(k12, digits = 2), " hr^-1")
+println("k21 = ", round(k21, digits = 2), " hr^-1")
+
+println("alpha = ", round(alpha, digits = 2)," hr^-1")
+println("beta = ", round(beta, digits = 2), " hr^-1")
+
+println("t_half (Distribution) = ", round(t_half_alpha, digits = 2), " hrs")
+println("t_half (Terminal) = ", round(t_half_beta, digits = 2), " hrs")
+
+println("Vss = ", round(Vss, digits = 2), " L")
+println("MRT = ", round(MRT, digits =  2), " hr")
+
+println("AUC (Dose=1 mg) = ", round(AUC, digits = 2), " mg*hr/L")
+```
+
+## Shrinkage summary
+Shrinkage values were compared between the two-compartment model with interindividual variability (IIV) on all parameters and the reduced model without IIV on peripheral volume (VP). In the full model, eta shrinkage was low for CL (0.043) and VC (0.035), but higher for Q (0.183), VP (0.275), and Ka (0.193). The relatively high shrinkage for VP suggests limited information in the data to reliably estimate variability in this parameter. Epsilon shrinkage was 0.186, indicating acceptable residual variability. In the reduced model (without IIV on VP), eta shrinkage remained low for CL (-0.005) and VC (0.027), and was moderate for Q (0.139) and Ka (0.204). Epsilon shrinkage was slightly lower (0.164), indicating a comparable or improved residual error estimation.
+The two-compartment model without IIV on VP was selected as the final model because:
+- High shrinkage on VP in the full model indicates poor identifiability of variability in this parameter
+- Removal of IIV on VP results in more stable and reliable parameter estimates
+- Shrinkage values in the reduced model remain low to moderate, supporting good estimation of individual parameters
+- Residual variability is slightly improved in the reduced model
+
+```{julia}
+#| echo: false
+#| output: false
+# Calculate eta-shrinkage for each random effect
+eta_shrink_two = ηshrinkage(fit_two_iiv_diag_v2)
+
+# Calculate epsilon-shrinkage
+epsilon_shrink_two = ϵshrinkage(fit_two_iiv_diag_v2)
+
+```
+
+# **Section 6: Model Evaluation**
+## **Goodness of Fit Plots**
+The goodness-of-fit plots for the final two-compartment model without interindividual variability on peripheral volume (VP) are presented in Figure 7.
+
+### Observed vs Population Predictions
+The observed concentrations show a general agreement with population predictions, although some dispersion is present, particularly at higher concentration values. This indicates that while the population model captures the overall trend, it does not fully account for individual variability.
+
+### Observed vs Individual Predictions
+A strong agreement is observed between individual predictions and observed data, with points closely aligned along the line of identity. This suggests that the model adequately describes individual concentration–time profiles after accounting for interindividual variability.
+
+### NPDE vs Time
+The NPDE values are symmetrically distributed around zero across time, with no apparent trends or time-dependent bias. This indicates that the model does not exhibit systematic deviations over the time course.
+
+### NPDE vs Population Predictions
+The NPDE values are randomly scattered around zero with no visible pattern across the range of population predictions. This suggests the absence of model misspecification related to concentration levels.
+
+### Overall Interpretation
+Overall, the goodness-of-fit plots indicate that the model provides an adequate description of the data. The absence of systematic bias in residuals and the good agreement between observed and individual predictions support the suitability of the final model.
+
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 7. Goodness-of-Fit Plots for Two-Compartment Model with IIV on CL, Vc, Ka"
+final_fit = fit_two_iiv_diag_v2
+final_inspect = inspect(final_fit; nsim = 200)
+inspect_df = DataFrame(final_inspect)
+df_insp = DataFrame(final_inspect)
+gof_plots = goodness_of_fit(final_inspect; observations = [:dv])
+gof = gof_plots.figure
+Label(gof[0, :], "Two Compartment Model with IIV - Goodness of Fit \n No IIV on Vp ", font = :bold, fontsize = 18)
+display(gof)
+```
+
+## NPDE distribution
+The NPDE distribution for the two-compartment model with interindividual variability on CL, Vc, and Ka is presented in Figure 8.
+The histogram shows that NPDE values are approximately symmetrically distributed around mean 0. The distribution appears reasonably bell-shaped, suggesting that the residuals follow an approximately normal distribution.
+
+Most NPDE values lie within the range of -2 to +2, with only a few observations in the tails, indicating the absence of significant outliers. There is no strong evidence of skewness or deviation from normality.
+
+The NPDE distribution plot suggests that the model provides an adequate description of the data, with no major model misspecification or bias. The residual variability is well captured, supporting the suitability of the model.
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 8. NPDE Distribution for Two-Compartment Model with IIV on CL, Vc, Ka"
+npde_plot = npde_dist(final_inspect; color = :brown, zeroline_color = :red, figure = (; fontsize = 18))
+display(npde_plot)
+```
+
+## **Individual Fits**
+
+Individual fits for selected subjects using the two-compartment model with interindividual variability on CL, Vc, and Ka are presented in Figure 9.
+The individual predictions (IPRED) generally show good agreement with the observed data across subjects, indicating that the model adequately captures individual concentration–time profiles. The model is able to describe both the distribution and elimination phases for most individuals.
+In comparison, the population predictions (PRED) tend to deviate more from the observed data, particularly during the early time points and at higher concentrations, reflecting the influence of interindividual variability.
+Some minor deviations between observed and predicted values are observed in certain individuals; however, no consistent bias or systematic trend is evident. It is noted that two subjects (Subject ID: 141, 6) were identified as outliers based on IWRES values, which may contribute to localized discrepancies in the fit.
+
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 9. Individual Fits for Two-Compartment Model with IIV on CL, Vc, Ka"
+fig_subject_fits2 = subject_fits(
+    final_inspect;
+    separate = true,
+    paginate = true,
+    facet = (; linkyaxes = false),
+    figure = (; fontsize = 18),
+    axis = (; xlabel = "Time (hr)", ylabel = "Concentration (mg/L)"),
+)
+fig_subject_fits2[12]
+```
+
+```{julia}
+#| echo: false
+#| output: false
+df_iwres = dropmissing(inspect_df, :dv_iwres)
+outliers_iwres = filter(row -> abs(row.dv_iwres) > 3, df_iwres)
+print(outliers_iwres)
+df_npde = dropmissing(inspect_df, :dv_npde)
+outliers_npde = filter(row -> abs(row.dv_npde) > 3, df_npde)
+print(outliers_npde)
+```
+
+## **EBE Diagnostics**
+### Eta correlation pairplot
+The diagonal histograms show that the eta distributions for CL (η₁), Vc (η₂), Q (η₃), and Ka (η₄) are approximately centered around zero, supporting the assumption of normally distributed interindividual variability. However, slight skewness and spread differences are observed, particularly for η₃ (Q) and η₄ (Ka), indicating higher variability in these parameters.
+
+Correlation Between Random Effects of the off-diagonal plots indicate mostly weak to moderate correlations between parameters:
+- η₁–η₂ (CL–Vc): Very weak correlation (cor ≈ 0.056), suggesting independence
+- η₁–η₃ (CL–Q): Low positive correlation (cor ≈ 0.204)
+- η₂–η₃ (Vc–Q): Moderate positive correlation (cor ≈ 0.235)
+- η₃–η₄ (Q–Ka): Moderate positive correlation (cor ≈ 0.225)
+η₁–η₄ and η₂–η₄: Very weak or negligible correlations (close to zero)
+These correlations are relatively small and do not indicate strong dependency between parameters.
+
+Overall, the eta distributions support the assumption of normality, and the correlations between random effects are low to moderate. There is no evidence of strong correlation that would suggest model overparameterization or identifiability issues. The slightly higher variability and moderate correlations involving Q and Ka are acceptable and do not adversely affect model stability.
+
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 10. Eta Correlation Pairplot for Two-Compartment Model with IIV on CL, Vc, Ka"
+ebes = @chain df_insp begin
+    select(r"^η")
+    dropmissing
+end
+
+ebe_pairplot = pairplot(ebes => (PairPlots.Scatter(marker = '∘', markersize = 24, alpha = 0.3, color = ColorSchemes.tab10.colors[1]), 
+                                 PairPlots.TrendLine(color = :red),         
+                                 PairPlots.PearsonCorrelation(fontsize = 15, color = :black),
+                                 PairPlots.MarginHist(color = ColorSchemes.tab10.colors[1])), 
+                            fullgrid = false
+)
+display(ebe_pairplot)
+```
+
+### Eta distributions
+The histograms for all parameters (η₁: CL, η₂: Vc, η₃: Q, η₄: Ka) are centered around zero, indicating that the interindividual variability is appropriately modeled with a mean close to zero. The distributions appear approximately symmetric and bell-shaped, supporting the assumption of normality. Slight skewness is observed, particularly for η₄ (Ka), which shows a wider spread, indicating higher variability in the absorption process. Similarly, η₃ (Q) shows moderate spread compared to η₁ and η₂. Overall, the eta distributions are consistent with the assumptions of the model, indicating that interindividual variability is well characterized and does not show significant deviations from normality.
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 11. Eta Distributions for Two-Compartment Model"
+
+eta_dist = empirical_bayes_dist(inspect(fit_two_iiv_diag_v2); color = :lightblue, zeroline_color = :red, figure = (; fontsize = 18))
+display(eta_dist)
+```
+
+
+### Eta vs covariates (exploratory)
+
+The Eta vs Age plot show no clear trend between η values (η₁–η₄) and AGE. The correlation coefficients are close to zero (r ≈ -0.01 to 0.04), indicating no significant relationship between age and model parameters. Similarly, no strong relationship is observed between η values and body weight. Correlation coefficients are low (r ≈ -0.06 to 0.08), suggesting that weight does not significantly influence the pharmacokinetic parameters in this model. The eta values are evenly distributed across different dose levels, with no visible trend. Correlation coefficients are also low (r ≈ -0.20 to 0.05), indicating no meaningful association between dose and variability in parameters. Overall, the absence of clear trends or strong correlations between eta values and covariates suggests that AGE, WT, and Dose are not significant predictors of interindividual variability in this model. Therefore, inclusion of these covariates is not warranted.
+
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 12. Empirical Bayes Estimates vs Covariates for Two-Compartment Model with IIV on CL, Vc, Ka"
+empirical_bayes_vs_covariates(inspect(fit_two_iiv_diag_v2), zeroline_color = :red)
+```
+
+## **Visual Predictive Check**
+Overall, the observed data are well captured within the simulated 95% confidence intervals, indicating that the model adequately describes both the central tendency and variability of the concentration–time profiles. No significant systematic bias is observed across time.
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 13. Visual Predictive Check for the final model"
+full_vpc = vpc(fit_two_iiv_diag_v2, 1000; observations = [:dv])
+full_vpc_plot = vpc_plot(two_comp_iiv_diag_v2, full_vpc;
+    axis = (;
+        xlabel = "Time (hr)",
+        ylabel = "Observed/Predicted\n Drug Concentration (ng/mL)",
+    ),
+    facet = (; combinelabels = true),
+)
+display(full_vpc_plot)
+```
+
+The stratified VPC by dose (5 mg, 20 mg, and 80 mg) further demonstrates consistent model performance across all dose levels. The observed percentiles generally fall within the prediction intervals for each dose group, suggesting that the model appropriately characterizes the pharmacokinetics across the studied dose range. Minor deviations at early time points, particularly at higher doses, are observed but are not considered significant.
+A small number of outliers are present; however, they do not affect the overall predictive performance of the model.
+```{julia}
+#| echo: false
+#| fig-cap: "Figure 14. Visual Predictive Check by Dose for the final model"
+vpc_stratify_dose = vpc(fit_two_iiv_diag_v2, 1000; observations = [:dv], stratify_by = [:Dose_mg])
+vpc_stratify_dose_plot = vpc_plot(two_comp_iiv_diag_v2, vpc_stratify_dose;
+    rows = 1,
+    columns = 3,
+    figure = (; size = (1400, 1000), fontsize = 22),
+    axis = (;
+        xlabel = "Time (hr)",
+        ylabel = "Observed/Predicted\n Drug Concentration (ng/mL)",
+    ),
+    facet = (; combinelabels = true),
+)
+display(vpc_stratify_dose_plot)
+```
+
+
+# **Section 7: Discussion and Conclusions**
+## Summary of final model
+A two-compartment population pharmacokinetic (PopPK) model with first-order absorption and linear elimination was successfully developed to describe the concentration–time data of the investigational analgesic compound.
+The final model included inter-individual variability (IIV) on clearance (CL), central volume of distribution (V1), intercompartmental clearance (Q), and absorption rate constant (Ka), while IIV on peripheral volume (V2) was excluded based on shrinkage and model stability considerations. A proportional residual error model was used to describe unexplained variability.
+The model adequately captured the key pharmacokinetic phases, including rapid absorption, distribution, and elimination. Parameter estimates were obtained with good precision, and the model demonstrated strong agreement between observed and predicted concentrations. Diagnostic evaluations, including goodness-of-fit plots, NPDE analysis, and visual predictive checks (VPC), confirmed that the model provides a reliable and unbiased description of the data.
+
+## Model strengths and limitations
+#### Strengths
+The final model demonstrated several strengths. The two-compartment structure effectively captured the biphasic decline observed in the concentration–time profiles, providing a clear improvement over one-compartment models. Most parameter estimates were obtained with good precision, supported by low relative standard errors and narrow confidence intervals.
+Model diagnostics indicated a good fit, with no significant bias observed in residual plots. The NPDE distribution was approximately normal, and the VPC results showed that the model adequately captured both the central tendency and variability across all dose levels.
+The refinement of the inter-individual variability structure, particularly the removal of IIV on V2, improved model stability and parameter identifiability without compromising model performance. Additionally, the model results were consistent with findings from noncompartmental analysis, supporting its reliability.
+
+### Limitations
+Despite its strengths, the model has some limitations. The peripheral volume (V2) was estimated with relatively higher uncertainty compared to other parameters, indicating limited information in the data to fully characterize this parameter.
+The sampling duration was limited to 8 hours post-dose, which may not fully capture the terminal elimination phase. This is supported by the relatively high AUC extrapolation observed in a subset of subjects, suggesting reduced reliability of AUC∞ estimates for those individuals.
+No significant relationships were identified between pharmacokinetic parameters and covariates such as age, body weight, and dose. This may reflect limited variability in the dataset or insufficient power to detect such effects.
+Additionally, minor deviations observed in the VPC at early time points suggest that the absorption phase could potentially be described more accurately with a more complex model.
+
+## Potential improvements for future
+Future analyses could benefit from extended sampling beyond 8 hours to better characterize the terminal elimination phase and reduce uncertainty in exposure estimates. Inclusion of additional covariates, such as sex, organ function, or genetic factors, may help explain inter-individual variability.
+Further refinement of the absorption model, such as incorporation of a lag time or transit compartments, could improve the description of early concentration–time data. Exploration of alternative variability structures or correlation between random effects may also enhance model performance.
+Finally, external validation using an independent dataset would strengthen confidence in the model and its predictive capabilities.
+
+## Conclusions regarding PK characteristics
+The investigational analgesic compound exhibits rapid absorption, with a short time to peak concentration, followed by a biphasic decline consistent with distribution and elimination processes. The estimated terminal half-life of approximately 9 hours suggests moderate elimination and supports the potential for once- or twice-daily dosing.
+The pharmacokinetics of the drug are largely dose-proportional across the studied range, with only slight evidence of supra-proportionality at higher doses. Inter-individual variability is moderate and well characterized by the model, with no significant influence of demographic covariates identified.
+Overall, the final two-compartment PopPK model provides a robust and biologically plausible description of the pharmacokinetics of the investigational drug and is suitable for further applications such as simulation, dose optimization, and future pharmacokinetic-pharmacodynamic modeling.
+
+# **Section 8: Appendices**
+## Complete model code
+```{julia}
+#| echo: false
+blocks = [:param, :random, :pre, :dynamics, :derived] 
+
+model_representation_full = Latexify.LaTeXString(
+    join([latexify(two_comp_iiv_diag_v2, block, index = :bracket, snakecase = true) for
+            block in blocks
+        ],
+        "\n\n", 
+    ),
+);
+model_representation_full
+```
+
+## Additional diagnostic plots
+
+```{julia}
+
+```
