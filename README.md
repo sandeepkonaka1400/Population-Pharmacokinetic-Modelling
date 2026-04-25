@@ -8,6 +8,7 @@
 
 A full end-to-end population pharmacokinetic (PopPK) analysis of an investigational oral analgesic compound, written as a reproducible Quarto report executed in Julia using Pumas v2.8.0. Covers non-compartmental analysis, structural model development, IIV evaluation, and model selection across 12 candidate models.
 
+https://sandeep-konakagautamdas.github.io/Population-Pharmacokinetic-Modelling/
 ---
 
 ## Study Design
